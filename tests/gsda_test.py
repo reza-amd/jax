@@ -79,7 +79,7 @@ class GSDATest(jtu.JaxTestCase):
     def cb(index):
       return global_input_data[index]
     gsda = GlobalShardedDeviceArray.from_callback(global_input_shape,
-                                                  jnp.float32, global_mesh,
+                                                  jnp.int32, global_mesh,
                                                   mesh_axes, cb)
     self.assertEqual(gsda.local_shards[0].index, expected_index[0])
     self.assertArraysEqual(gsda.local_shards[0].data,
@@ -123,7 +123,7 @@ class GSDATest(jtu.JaxTestCase):
     def cb(index):
       return global_input_data[index]
     gsda = GlobalShardedDeviceArray.from_callback(global_input_shape,
-                                                  jnp.float32, global_mesh,
+                                                  jnp.int32, global_mesh,
                                                   mesh_axes, cb)
     self.assertEqual(gsda.local_shards[0].index, expected_index[0])
     self.assertArraysEqual(gsda.local_shards[0].data,
@@ -156,7 +156,7 @@ class GSDATest(jtu.JaxTestCase):
     def cb(index):
       return global_input_data[index]
     gsda = GlobalShardedDeviceArray.from_callback(global_input_shape,
-                                                  jnp.float32, global_mesh,
+                                                  jnp.int32, global_mesh,
                                                   mesh_axes, cb)
     self.assertEqual(gsda.local_shards[0].index, expected_index[0])
     self.assertArraysEqual(gsda.local_shards[0].data,
@@ -185,7 +185,7 @@ class GSDATest(jtu.JaxTestCase):
     def cb(index):
       return global_input_data[index]
     gsda = GlobalShardedDeviceArray.from_callback(global_input_shape,
-                                                  jnp.float32, global_mesh,
+                                                  jnp.int32, global_mesh,
                                                   mesh_axes, cb)
     self.assertEqual(gsda.local_shards[0].index, expected_index[0])
     self.assertArraysEqual(gsda.local_shards[0].data,
@@ -214,7 +214,7 @@ class GSDATest(jtu.JaxTestCase):
       return [global_input_data[index] for index in indices]
 
     gsda = GlobalShardedDeviceArray.from_batched_callback(
-        global_input_shape, jnp.float32, global_mesh, mesh_axes, cb)
+        global_input_shape, jnp.int32, global_mesh, mesh_axes, cb)
     expected_first_shard_value = np.array([[0, 1]])
     self.assertArraysEqual(gsda.local_shards[0].data.to_py(),
                            expected_first_shard_value)
@@ -227,7 +227,7 @@ class GSDATest(jtu.JaxTestCase):
     global_input_shape = (8, 2)
     mesh_axes = ['x']
     global_input_data = np.arange(
-        prod(global_input_shape)).reshape(global_input_shape)
+        prod(global_input_shape), dtype=np.float32).reshape(global_input_shape)
 
     def cb(cb_inp):
       self.assertLen(cb_inp, 4)
@@ -241,12 +241,28 @@ class GSDATest(jtu.JaxTestCase):
 
     gsda = GlobalShardedDeviceArray.from_batched_callback_with_devices(
         global_input_shape, jnp.float32, global_mesh, mesh_axes, cb)
-    expected_first_shard_value = np.array([[0, 1], [2, 3]])
+    expected_first_shard_value = np.array([[0, 1], [2, 3]], dtype=np.float32)
     self.assertArraysEqual(gsda.local_shards[0].data.to_py(),
                            expected_first_shard_value)
-    expected_second_shard_value = np.array([[0, 1], [2, 3]])
+    expected_second_shard_value = np.array([[0, 1], [2, 3]], dtype=np.float32)
     self.assertArraysEqual(gsda.local_shards[1].data.to_py(),
                            expected_second_shard_value)
+
+  def test_pjit_gsda_wrong_dtype(self):
+    global_mesh = create_global_mesh((4, 2), ('x', 'y'))
+    global_input_shape = (8, 2)
+    mesh_axes = ['x', 'y']
+    global_input_data = np.arange(
+        prod(global_input_shape)).reshape(global_input_shape)
+    def cb(index):
+      return global_input_data[index]
+
+    with self.assertRaisesRegex(
+        AssertionError,
+        ("GSDA dtype must match the input dtype. Got gsda dtype: "
+         "<class 'jax._src.numpy.lax_numpy.float32'>, input dtype: int32")):
+      GlobalShardedDeviceArray.from_callback(global_input_shape, jnp.float32,
+                                             global_mesh, mesh_axes, cb)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

@@ -30,7 +30,8 @@ from jax.errors import JAXTypeError
 from jax import lax
 # TODO(skye): do we still wanna call this PartitionSpec?
 from jax.experimental import PartitionSpec as P
-from jax.experimental.maps import xmap, mesh
+from jax.experimental.maps import xmap, mesh, Mesh
+from jax.experimental import gsda
 import jax.experimental.pjit as pjit_lib
 from jax.experimental.pjit import pjit, pjit_p, with_sharding_constraint, SpecSync
 from jax.interpreters import pxla
@@ -60,6 +61,63 @@ def check_1d_2d_mesh(f, set_mesh):
       ("2x1", (("x", 2), ("y", 1)), ("x", "y")),
       ("2x2", (("x", 2), ("y", 2)), ("x", "y")),
     ))(jtu.with_mesh_from_kwargs(f) if set_mesh else f)
+
+
+def create_global_mesh(mesh_shape, axis_names):
+  size = prod(mesh_shape)
+  if len(jax.devices()) < size:
+    raise unittest.SkipTest(f"Test requires {size} local devices")
+  mesh_devices = np.array(jax.devices()[:size]).reshape(mesh_shape)
+  global_mesh = Mesh(mesh_devices, axis_names)
+  return global_mesh
+
+
+class GSDAPjitTest(jtu.JaxTestCase):
+
+  @jtu.with_mesh([('x', 4), ('y', 2)])
+  def test_pjit_gsda_single_output(self):
+    global_mesh = create_global_mesh((4, 2), ('x', 'y'))
+    global_input_shape = (8, 2)
+    mesh_axes = ['x', 'y']
+    global_input_data = np.arange(
+        prod(global_input_shape)).reshape(global_input_shape)
+    def cb(index):
+      return global_input_data[index]
+
+    gsda_obj = gsda.GlobalShardedDeviceArray.from_callback(
+        global_input_shape, jnp.int32, global_mesh, mesh_axes, cb)
+
+    @partial(pjit, in_axis_resources=P('x', 'y'), out_axis_resources=P('x', 'y'))
+    def f(x):
+      return x @ x.T
+
+    out = f(gsda_obj)
+    # TODO(yashkatariya): Enable the gsda_out flag and check for GSDA as the
+    # output.
+    self.assertIsInstance(out, pxla.ShardedDeviceArray)
+    self.assertLen(out.device_buffers, 8)
+    self.assertEqual(out.device_buffers[0].shape, (2, 4))
+
+  @jtu.with_mesh([('x', 2), ('y', 2)])
+  def test_pjit_gsda_mesh_mismatch(self):
+    global_mesh = create_global_mesh((4, 2), ('x', 'y'))
+    global_input_shape = (8, 2)
+    mesh_axes = ['x', 'y']
+    global_input_data = np.arange(
+        prod(global_input_shape), dtype=np.float32).reshape(global_input_shape)
+    def cb(index):
+      return global_input_data[index]
+
+    gsda_obj = gsda.GlobalShardedDeviceArray.from_callback(
+        global_input_shape, jnp.float32, global_mesh, mesh_axes, cb)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Pjit's mesh and GSDA's mesh should be equal."):
+      @partial(pjit, in_axis_resources=P('x', 'y'), out_axis_resources=P('x', 'y'))
+      def f(x):
+        return x
+      f(gsda_obj)
 
 
 # TODO(skye): make the buffer donation utils part of JaxTestCase
@@ -760,15 +818,15 @@ class PJitErrorTest(jtu.JaxTestCase):
       pjit(lambda x, y: x, p, p)(x, x)  # Error, but make sure we hint at tupling
     # TODO(apaszke): Disable implicit list casts and enable this
     # error = re.escape(
-        # r"pjit in_axis_resources specification must be a tree prefix of the "
-        # r"corresponding value, got specification (None, None, None) for value "
-        # r"tree PyTreeDef(([*, *, *],)). Note that pjit in_axis_resources that "
-        # r"are non-trivial pytrees should always be wrapped in a tuple representing "
-        # r"the argument list. In particular, you're passing in a single argument "
-        # r"which means that pjit in_axis_resources might need to be wrapped in a "
-        # r"singleton tuple.")
+    # r"pjit in_axis_resources specification must be a tree prefix of the "
+    # r"corresponding value, got specification (None, None, None) for value "
+    # r"tree PyTreeDef(([*, *, *],)). Note that pjit in_axis_resources that "
+    # r"are non-trivial pytrees should always be wrapped in a tuple representing "
+    # r"the argument list. In particular, you're passing in a single argument "
+    # r"which means that pjit in_axis_resources might need to be wrapped in a "
+    # r"singleton tuple.")
     # with self.assertRaisesRegex(ValueError, error):
-      # pjit(lambda x: x, p, p)([x, x, x])  # Error, but make sure we hint at singleton tuple
+    # pjit(lambda x: x, p, p)([x, x, x])  # Error, but make sure we hint at singleton tuple
     error = re.escape(
         r"pjit out_axis_resources specification must be a tree prefix of the "
         r"corresponding value, got specification [[None, None, None], None] for "

@@ -13,18 +13,20 @@
 # limitations under the License.
 """Implementation of GlobalShardedDeviceArray."""
 
+import operator
 from collections import defaultdict, Counter
 import dataclasses
 import numpy as np
 from typing import Callable, Sequence, Tuple, Union, Mapping, Optional, List, Dict
+
+from . import maps
 from .. import core
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
-from ..interpreters import pxla
+from ..interpreters import pxla, xla
 from .._src.util import prod, safe_zip
 from .._src.api import device_put
 from ..interpreters.sharded_jit import PartitionSpec
-from .pjit import get_array_mapping, _prepare_axis_resources
 
 Shape = Tuple[int, ...]
 MeshAxes = Sequence[Union[str, Tuple[str], None]]
@@ -47,6 +49,9 @@ class _HashableIndex:
 
 def get_shard_indices(global_shape: Shape, global_mesh: pxla.Mesh,
                       mesh_axes: MeshAxes) -> Mapping[Device, Index]:
+  # Import here to avoid cyclic import error when importing gsda in pjit.py.
+  from .pjit import get_array_mapping, _prepare_axis_resources
+
   if not isinstance(mesh_axes, PartitionSpec):
     pspec = PartitionSpec(*mesh_axes)
   else:
@@ -97,7 +102,7 @@ class GlobalShardedDeviceArray:
   def __init__(self, global_shape: Shape, dtype, global_mesh: pxla.Mesh,
                mesh_axes: MeshAxes, device_buffers: Sequence[DeviceArray]):
     self._global_shape = global_shape
-    self._dtype = dtype
+    self.dtype = dtype
     self._global_mesh = global_mesh
     self._mesh_axes = mesh_axes
     assert len(device_buffers) == len(self._global_mesh.local_devices)
@@ -108,6 +113,10 @@ class GlobalShardedDeviceArray:
     assert all(db.shape == ss for db in device_buffers), (
         f"Expected shard shape {ss} doesn't match the device buffer "
         f"shape {device_buffers[0].shape}")
+
+    assert all(db.dtype == self.dtype for db in device_buffers), (
+        'GSDA dtype must match the input dtype. '
+        f'Got gsda dtype: {self.dtype}, input dtype: {device_buffers[0].dtype}')
 
   @property
   def shape(self) -> Shape:
@@ -130,6 +139,8 @@ class GlobalShardedDeviceArray:
       sh = Shard(device, index, replica_id, buf)
       gs.append(sh)
       if local_shard:
+        if sh.data is None:
+          raise ValueError("Local shard's data field should not be None.")
         ls.append(sh)
     return gs, ls
 
@@ -181,3 +192,17 @@ class GlobalShardedDeviceArray:
     ]
     dbs = data_callback(cb_inp)
     return cls(global_shape, dtype, global_mesh, mesh_axes, dbs)
+
+
+core.pytype_aval_mappings[GlobalShardedDeviceArray] = operator.attrgetter('local_shards')
+xla.pytype_aval_mappings[GlobalShardedDeviceArray] = operator.attrgetter('local_shards')
+xla.canonicalize_dtype_handlers[GlobalShardedDeviceArray] = pxla.identity
+
+def _gsda_shard_arg(x, devices, indices):
+  pjit_mesh = maps.thread_resources.env.physical_mesh
+  if x._global_mesh != pjit_mesh:
+    raise ValueError("Pjit's mesh and GSDA's mesh should be equal. Got Pjit "
+                     f"mesh: {pjit_mesh},\n GSDA mesh: {x._global_mesh}")
+  return [s.data for s in x.local_shards]
+
+pxla.shard_arg_handlers[GlobalShardedDeviceArray] = _gsda_shard_arg
